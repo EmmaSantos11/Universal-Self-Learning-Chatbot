@@ -1,17 +1,16 @@
 """
 Cloud-native Self-Learning Chatbot
-- Vector store: FAISS (no Chroma, no torch)
-- Embeddings: Hugging-Face Inference API (free, no local model)
-- Search: ddgs
-- Memory: local FAISS index
-- LLM: Gemini (default) or OpenAI
-Author: Ohamadike Emmanuel Chidera
+Runs on: Streamlit-Cloud, local, phone, colab
+Learns: per-user memory + nightly web scrape + auto-search
+Embeddings: Hugging-Face Inference API (free, no local model)
+Vector store: FAISS-cpu (no Chroma, no torch)
+LLM: Gemini (default) or OpenAI
+Author: Ohamadike Chidera Emmanuel
 """
-import os, json, time
+import os, json, time, threading, schedule, requests
 from datetime import datetime
 from dotenv import load_dotenv
 import streamlit as st
-import requests
 import faiss
 import numpy as np
 from ddgs import DDGS
@@ -72,7 +71,7 @@ index, meta = load_or_create_index()
 
 def embed(text: str) -> np.ndarray:
     headers = {"Authorization": f"Bearer {GEMINI_KEY or OPENAI_KEY}"}
-    resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": text})
+    resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": text}, timeout=30)
     resp.raise_for_status()
     return np.array(resp.json(), dtype=np.float32)
 
