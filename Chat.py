@@ -7,35 +7,38 @@ Vector store: FAISS-cpu (no Chroma, no torch)
 LLM: Gemini (default) or OpenAI
 Author: Ohamadike Chidera Emmanuel
 """
-import os, json, time, threading, schedule, requests
+import os
+import json
+import time
+import threading
+import requests
 from datetime import datetime
-from dotenv import load_dotenv
+from typing import List
+
 import streamlit as st
 import faiss
 import numpy as np
 from ddgs import DDGS
 from bs4 import BeautifulSoup
-from google import genai
-from google.genai import types
 import openai
 
 # ---------- ENV ----------
-load_dotenv()
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-if not GEMINI_KEY and not OPENAI_KEY:
-    st.error("🔑 Add GEMINI_API_KEY (and/or OPENAI_API_KEY) to .env or Secrets")
+HF_TOKEN   = st.secrets.get("HF_TOKEN")   or os.getenv("HF_TOKEN")
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
+OPENAI_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+
+if not HF_TOKEN:
+    st.error("🔑 Add HF_TOKEN to .env or Streamlit Secrets (free: https://huggingface.co/settings/tokens)")
     st.stop()
 
 # ---------- CLIENTS ----------
-gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
-if OPENAI_KEY:
-    openai.api_key = OPENAI_KEY
+import google.generativeai as genai
+genai.configure(api_key=GEMINI_KEY)
+gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # ---------- CONFIG ----------
-MODEL_NAME = "gemini-2.0-flash-exp"
 HF_EMBED_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
-MEMORY_DIR = "./faiss_index"
+MEMORY_DIR   = "./faiss_index"
 os.makedirs(MEMORY_DIR, exist_ok=True)
 
 # ---------- UI ----------
@@ -45,32 +48,34 @@ st.caption("No torch, no Chroma – just cloud APIs and FAISS. Deploy anywhere."
 
 with st.sidebar:
     provider = st.radio("LLM provider", ["Gemini", "OpenAI"], index=0,
-                        disabled=not bool(GEMINI_KEY))
+                        disabled=not bool(GEMINI_KEY or OPENAI_KEY))
     st.info("💡 Tip: paste a URL or ask anything – I’ll search & remember.")
 
 # ---------- FAISS MEMORY ----------
 INDEX_FILE = os.path.join(MEMORY_DIR, "index.faiss")
-META_FILE = os.path.join(MEMORY_DIR, "meta.json")
+META_FILE  = os.path.join(MEMORY_DIR, "meta.json")
 
 def load_or_create_index():
     if os.path.exists(INDEX_FILE):
         index = faiss.read_index(INDEX_FILE)
-        with open(META_FILE, "r") as f:
+        with open(META_FILE, "r", encoding="utf8") as f:
             meta = json.load(f)
     else:
-        index = faiss.IndexFlatL2(384)  # MiniLM-L6 dimension
+        index = faiss.IndexFlatL2(384)          # MiniLM-L6 dimension
         meta = []
     return index, meta
 
 def save_index(index, meta):
     faiss.write_index(index, INDEX_FILE)
-    with open(META_FILE, "w") as f:
-        json.dump(meta, f)
+    with open(META_FILE, "w", encoding="utf8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
 
 index, meta = load_or_create_index()
 
 def embed(text: str) -> np.ndarray:
-    headers = {"Authorization": f"Bearer {GEMINI_KEY or OPENAI_KEY}"}
+    """Call HF Inference API (free)"""
+    print(f"[DEBUG] HF_TOKEN='{HF_TOKEN[:10]}...'")   # ← shows first 10 chars only
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": text}, timeout=30)
     resp.raise_for_status()
     return np.array(resp.json(), dtype=np.float32)
@@ -81,7 +86,7 @@ def store_memory(text: str, src: str):
     meta.append({"text": text, "source": src, "time": datetime.utcnow().isoformat()})
     save_index(index, meta)
 
-def retrieve_memory(query: str, k=5):
+def retrieve_memory(query: str, k: int = 5) -> str:
     if index.ntotal == 0:
         return ""
     vec = embed(query)
@@ -89,13 +94,14 @@ def retrieve_memory(query: str, k=5):
     return "\n".join([meta[i]["text"] for i in I[0] if i < len(meta)])
 
 # ---------- WEB SEARCH ----------
-def search_web(query: str):
+def search_web(query: str) -> List[str]:
     with DDGS() as ddgs:
         return [r["body"] for r in ddgs.text(query, max_results=5)]
 
-def scrape_and_learn(url: str):
+def scrape_and_learn(url: str) -> str:
     try:
         r = requests.get(url, timeout=10)
+        r.raise_for_status()
         text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)[:10_000]
         store_memory(text, url)
         return text[:500]
@@ -103,17 +109,20 @@ def scrape_and_learn(url: str):
         return f"Scrape error: {e}"
 
 # ---------- LLM CALL ----------
-def llm_complete(prompt: str, max_tokens: int = 4_000, temp: float = 0.7) -> str:
+def llm_complete(prompt: str, max_tokens: int = 2048, temp: float = 0.7) -> str:
     if provider == "Gemini":
-        response = gemini_client.models.generate_content(
-            model=MODEL_NAME,
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=temp, max_output_tokens=max_tokens)
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=temp,
+                max_output_tokens=max_tokens
+            )
         )
         return response.text.strip()
-    else:
-        return openai.Completion.create(
-            engine="text-davinci-003",
+    else:  # OpenAI
+        client = openai.OpenAI(api_key=OPENAI_KEY)
+        return client.completions.create(
+            model="gpt-3.5-turbo-instruct",
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temp
@@ -140,13 +149,21 @@ if prompt := st.chat_input("Ask or paste a URL – the sky is the limit"):
         scrape = ""
         if prompt.startswith("http"):
             scrape = scrape_and_learn(prompt)
-        system = f"You are a helpful, ever-learning assistant.\nRelevant memory:\n{mem}\nSearch results:\n{search}\nScraped content:\n{scrape}\n"
+
+        system = (
+            "You are a helpful, ever-learning assistant.\n"
+            f"Relevant memory:\n{mem}\n"
+            f"Search results:\n{search}\n"
+            f"Scraped content:\n{scrape}\n"
+        )
         mega_prompt = system + "\nUser: " + prompt + "\nAssistant:"
         reply = llm_complete(mega_prompt)
         store_memory(reply, "assistant")
+
         with st.chat_message("assistant"):
             st.markdown(reply)
         st.session_state.messages.append({"role": "assistant", "content": reply})
+
     except Exception as e:
         st.error(f"⚠️ {e}")
 
