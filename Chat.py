@@ -1,24 +1,26 @@
 """
-Universal Self-Learning Chatbot
-Runs on: Streamlit-Cloud, local, phone, colab
-Learns: per-user memory + nightly web scrape + auto-search
-Gemini default (free), OpenAI optional
-Author: Ohamadike Chidera Emmanuel
+Cloud-native Self-Learning Chatbot
+- Vector store: FAISS (no Chroma, no torch)
+- Embeddings: Hugging-Face Inference API (free, no local model)
+- Search: ddgs
+- Memory: local FAISS index
+- LLM: Gemini (default) or OpenAI
+Author: Ohamadike Emmanuel Chidera
 """
-import os, time, json, threading, schedule, requests
+import os, json, time
 from datetime import datetime
 from dotenv import load_dotenv
 import streamlit as st
-from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
-from sentence_transformers import SentenceTransformer
-import chromadb
+import requests
+import faiss
+import numpy as np
 from ddgs import DDGS
 from bs4 import BeautifulSoup
 from google import genai
 from google.genai import types
 import openai
 
-# ------------------ ENV ------------------
+# ---------- ENV ----------
 load_dotenv()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -26,88 +28,83 @@ if not GEMINI_KEY and not OPENAI_KEY:
     st.error("🔑 Add GEMINI_API_KEY (and/or OPENAI_API_KEY) to .env or Secrets")
     st.stop()
 
-# ------------------ CLIENTS ------------------
+# ---------- CLIENTS ----------
 gemini_client = genai.Client(api_key=GEMINI_KEY) if GEMINI_KEY else None
 if OPENAI_KEY:
     openai.api_key = OPENAI_KEY
 
-# ------------------ CONFIG ------------------
+# ---------- CONFIG ----------
 MODEL_NAME = "gemini-2.0-flash-exp"
-MAX_TOKENS = 30_000
-MEMORY_DIR = "./long_term_memory"
+HF_EMBED_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2"
+MEMORY_DIR = "./faiss_index"
 os.makedirs(MEMORY_DIR, exist_ok=True)
 
-# ------------------ UI ------------------
-st.set_page_config(page_title="∞ Self-Learning Bot", layout="wide")
-st.title("∞ Self-Learning Chatbot")
-st.caption("Learns from you, surfs the web, remembers everything. Deploy once, use anywhere.")
+# ---------- UI ----------
+st.set_page_config(page_title="∞ Cloud-Native Bot", layout="wide")
+st.title("∞ Cloud-Native Self-Learning Bot")
+st.caption("No torch, no Chroma – just cloud APIs and FAISS. Deploy anywhere.")
 
 with st.sidebar:
     provider = st.radio("LLM provider", ["Gemini", "OpenAI"], index=0,
                         disabled=not bool(GEMINI_KEY))
     st.info("💡 Tip: paste a URL or ask anything – I’ll search & remember.")
 
-# ------------------ MODELS ------------------
-@st.cache_resource(show_spinner=False)
-def load_models():
-    tok = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
-    tok.pad_token = tok.eos_token
-    mdl = AutoModelForCausalLM.from_pretrained("microsoft/DialoGPT-medium")
-    dialo = pipeline("text-generation", model=mdl, tokenizer=tok,
-                     pad_token_id=tok.eos_token_id, return_full_text=False)
-    emb = SentenceTransformer("all-MiniLM-L6-v2")
-    return dialo, emb
+# ---------- FAISS MEMORY ----------
+INDEX_FILE = os.path.join(MEMORY_DIR, "index.faiss")
+META_FILE = os.path.join(MEMORY_DIR, "meta.json")
 
-dialo_chat, embedder = load_models()
+def load_or_create_index():
+    if os.path.exists(INDEX_FILE):
+        index = faiss.read_index(INDEX_FILE)
+        with open(META_FILE, "r") as f:
+            meta = json.load(f)
+    else:
+        index = faiss.IndexFlatL2(384)  # MiniLM-L6 dimension
+        meta = []
+    return index, meta
 
-# ------------------ CHROMA MEMORY ------------------
-chroma_client = chromadb.PersistentClient(path=MEMORY_DIR)
-collection = chroma_client.get_or_create_collection(name="universal_memory")
+def save_index(index, meta):
+    faiss.write_index(index, INDEX_FILE)
+    with open(META_FILE, "w") as f:
+        json.dump(meta, f)
 
-def store_memory(text: str, meta: dict):
-    collection.add(documents=[text], metadatas=[meta], ids=[str(hash(text))])
+index, meta = load_or_create_index()
+
+def embed(text: str) -> np.ndarray:
+    headers = {"Authorization": f"Bearer {GEMINI_KEY or OPENAI_KEY}"}
+    resp = requests.post(HF_EMBED_URL, headers=headers, json={"inputs": text})
+    resp.raise_for_status()
+    return np.array(resp.json(), dtype=np.float32)
+
+def store_memory(text: str, src: str):
+    vec = embed(text)
+    index.add(vec.reshape(1, -1))
+    meta.append({"text": text, "source": src, "time": datetime.utcnow().isoformat()})
+    save_index(index, meta)
 
 def retrieve_memory(query: str, k=5):
-    emb = embedder.encode(query).tolist()
-    docs = collection.query(query_embeddings=[emb], n_results=k)["documents"]
-    if not docs:
+    if index.ntotal == 0:
         return ""
-    flat = [item for sublist in docs for item in sublist]
-    return "\n".join(flat)
+    vec = embed(query)
+    D, I = index.search(vec.reshape(1, -1), k)
+    return "\n".join([meta[i]["text"] for i in I[0] if i < len(meta)])
 
-# ------------------ WEB SEARCH ------------------
+# ---------- WEB SEARCH ----------
 def search_web(query: str):
     with DDGS() as ddgs:
         return [r["body"] for r in ddgs.text(query, max_results=5)]
 
-# ------------------ WEB SCRAPE ------------------
 def scrape_and_learn(url: str):
     try:
-        rsp = requests.get(url, timeout=10)
-        soup = BeautifulSoup(rsp.text, "lxml")
-        text = soup.get_text(" ", strip=True)[:10_000]
-        store_memory(text, {"source": url, "time": datetime.utcnow().isoformat()})
+        r = requests.get(url, timeout=10)
+        text = BeautifulSoup(r.text, "lxml").get_text(" ", strip=True)[:10_000]
+        store_memory(text, url)
         return text[:500]
     except Exception as e:
         return f"Scrape error: {e}"
 
-# ------------------ BACKGROUND SCRAPER ------------------
-def nightly_scrape():
-    urls = ["https://en.wikipedia.org/wiki/Main_Page", "https://news.ycombinator.com"]
-    for u in urls:
-        scrape_and_learn(u)
-    store_memory("Background scrape finished.", {"source": "scheduler"})
-
-def run_scheduler():
-    schedule.every().day.at("03:00").do(nightly_scrape)
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-
-threading.Thread(target=run_scheduler, daemon=True).start()
-
-# ------------------ LLM CALL ------------------
-def llm_complete(prompt: str, max_tokens: int = MAX_TOKENS, temp: float = 0.7) -> str:
+# ---------- LLM CALL ----------
+def llm_complete(prompt: str, max_tokens: int = 4_000, temp: float = 0.7) -> str:
     if provider == "Gemini":
         response = gemini_client.models.generate_content(
             model=MODEL_NAME,
@@ -123,7 +120,7 @@ def llm_complete(prompt: str, max_tokens: int = MAX_TOKENS, temp: float = 0.7) -
             temperature=temp
         ).choices[0].text.strip()
 
-# ------------------ CHAT ------------------
+# ---------- CHAT ----------
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -146,19 +143,16 @@ if prompt := st.chat_input("Ask or paste a URL – the sky is the limit"):
             scrape = scrape_and_learn(prompt)
         system = f"You are a helpful, ever-learning assistant.\nRelevant memory:\n{mem}\nSearch results:\n{search}\nScraped content:\n{scrape}\n"
         mega_prompt = system + "\nUser: " + prompt + "\nAssistant:"
-
         reply = llm_complete(mega_prompt)
-        store_memory(reply, {"role": "assistant", "time": datetime.utcnow().isoformat()})
-
+        store_memory(reply, "assistant")
         with st.chat_message("assistant"):
             st.markdown(reply)
         st.session_state.messages.append({"role": "assistant", "content": reply})
-
     except Exception as e:
         st.error(f"⚠️ {e}")
 
-# ------------------ EXPORT MEMORY ------------------
+# ---------- EXPORT ----------
 if st.sidebar.button("Download memory JSON"):
-    data = collection.get()
-    json_str = json.dumps({"memory": data}, indent=2, default=str)
+    data = {"index": index.ntotal, "meta": meta}
+    json_str = json.dumps(data, indent=2, default=str)
     st.sidebar.download_button("📥 memory.json", json_str, file_name="memory.json")
